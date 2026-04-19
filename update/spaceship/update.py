@@ -13,7 +13,7 @@ DEFAULT_CONFIG = {
     "API_KEY": "",
     "API_SECRET": "",
     "DOMAIN": "example.com",
-    "SUBDOMAINS": ["@", "www", "*"],  # Comma separated if using Env/Args
+    "SUBDOMAINS": ["@", "www", "*"],  # 默认的子域名列表
     "MAX_IP_COUNT": 2,
     "TTL": 300,
     "API_URL": "https://spaceship.dev/api/v1/dns/records"
@@ -29,7 +29,7 @@ logging.basicConfig(
 
 def get_config_value(env_key, arg_val, default_val, cast_type=str):
     """
-    Priority: Environment Variable > Command Line Argument > Default Value
+    优先级: 环境变量 > 命令行参数 > 默认值
     """
     val = os.getenv(env_key)
     if val is not None:
@@ -41,11 +41,11 @@ def get_config_value(env_key, arg_val, default_val, cast_type=str):
 def parse_list(value):
     if isinstance(value, list):
         return value
-    return [x.strip() for x in value.split(',') if x.strip()]
+    return[x.strip() for x in value.split(',') if x.strip()]
 
 def get_best_ips(csv_path):
-    """Reads CSV and returns IPs sorted by Speed (desc) and Latency (asc)."""
-    ips = []
+    """读取 CSV，按照速度(降序)和延迟(升序)排序并返回最优 IP"""
+    ips = list()
     try:
         with open(csv_path, mode='r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
@@ -60,12 +60,12 @@ def get_best_ips(csv_path):
                 except (ValueError, KeyError):
                     continue
         
-        # Sort: High Speed first, Low Latency second
+        # 排序：速度越快越前，延迟越低越前
         ips.sort(key=lambda x: (-x['speed'], x['latency']))
         return [x['ip'] for x in ips]
     except Exception as e:
         logging.error(f"Failed to read CSV: {e}")
-        return []
+        return list()
 
 class SpaceshipDNS:
     def __init__(self, domain, api_key, api_secret, base_url):
@@ -78,8 +78,8 @@ class SpaceshipDNS:
         self.url = f"{base_url}/{domain}"
 
     def get_all_records(self):
-        """Fetches all DNS records using pagination."""
-        all_items = []
+        """分页获取当前域名的所有自定义 DNS 记录"""
+        all_items = list()
         skip = 0
         take = 100
         
@@ -89,7 +89,8 @@ class SpaceshipDNS:
                 resp = requests.get(self.url, headers=self.headers, params=params)
                 resp.raise_for_status()
                 
-                items = resp.json().get('items', [])
+                # 安全获取 items
+                items = resp.json().get('items', list())
                 if not items:
                     break
                     
@@ -102,32 +103,45 @@ class SpaceshipDNS:
                 break
         return all_items
 
-    def update_records(self, delete_list, add_list):
-        """Executes batch delete followed by batch add."""
-        # 1. Delete old records
-        if delete_list:
-            try:
-                logging.info(f"Deleting {len(delete_list)} old records...")
-                # Process in chunks to be safe
-                chunk_size = 50
-                for i in range(0, len(delete_list), chunk_size):
-                    batch = delete_list[i:i + chunk_size]
-                    requests.delete(self.url, headers=self.headers, json={"items": batch})
-            except Exception as e:
-                logging.error(f"Delete failed: {e}")
-
-        # 2. Add new records
+    def update_records_zero_downtime(self, delete_list, add_list):
+        """
+        零停机更新 (Zero Downtime Update):
+        核心逻辑：先 ADD 新记录保障网络畅通，再 DELETE 淘汰旧记录。
+        """
+        
+        # 步骤 1: 优先添加新记录 (PUT 追加)
         if add_list:
             try:
-                logging.info(f"Adding {len(add_list)} new records...")
+                logging.info(f"Step 1: Adding {len(add_list)} NEW records...")
                 payload = {"force": True, "items": add_list}
-                requests.put(self.url, headers=self.headers, json=payload)
-            except Exception as e:
-                logging.error(f"Add failed: {e}")
+                resp = requests.put(self.url, headers=self.headers, json=payload)
+                resp.raise_for_status()
+                logging.info("Successfully added new records. New IPs are active.")
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Failed to add new records: {e}")
+                if e.response is not None:
+                    logging.error(f"API Error Details: {e.response.text}")
+                
+                # 严重安全防线：如果追加新 IP 失败，绝不执行删除操作，以防域名彻底断网
+                logging.error("Aborting deletion of old records to maintain DNS availability.")
+                return
+
+        # 步骤 2: 删除过期记录 (DELETE 移除)
+        if delete_list:
+            try:
+                logging.info(f"Step 2: Deleting {len(delete_list)} OLD records...")
+                # Spaceship 的 DELETE 接口允许直接传入需要删除的对象数组
+                resp = requests.delete(self.url, headers=self.headers, json=delete_list)
+                resp.raise_for_status()
+                logging.info("Successfully deleted old records. Seamless replacement complete!")
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Failed to delete old records: {e}")
+                if e.response is not None:
+                    logging.error(f"API Error Details: {e.response.text}")
 
 def main():
-    # 1. Parse Arguments
-    parser = argparse.ArgumentParser(description="Spaceship DNS Updater")
+    # 1. 参数解析
+    parser = argparse.ArgumentParser(description="Spaceship DNS Updater (Zero-Downtime)")
     parser.add_argument('--csv', help="Path to result.csv")
     parser.add_argument('--key', help="API Key")
     parser.add_argument('--secret', help="API Secret")
@@ -137,7 +151,7 @@ def main():
     parser.add_argument('--ttl', type=int, help="TTL")
     args = parser.parse_args()
 
-    # 2. Resolve Configuration (Env > Args > Default)
+    # 2. 配置组装 (环境变量 > 命令行 > 默认值)
     cfg = {
         "CSV": get_config_value("CSV_FILE", args.csv, DEFAULT_CONFIG["CSV_FILE"]),
         "KEY": get_config_value("SPACESHIP_KEY", args.key, DEFAULT_CONFIG["API_KEY"]),
@@ -150,45 +164,58 @@ def main():
     }
 
     if not cfg["KEY"] or not cfg["SECRET"]:
-        logging.error("API Key and Secret are required.")
+        logging.error("API Key and Secret are required. Please configure them.")
         sys.exit(1)
 
-    # 3. Get IP List
+    # 3. 提取优质 IP 目标列表
     all_ips = get_best_ips(cfg["CSV"])
     if not all_ips:
-        logging.error("No valid IPs found.")
+        logging.error("No valid IPs found in CSV.")
         sys.exit(1)
 
     target_ips = all_ips[:min(len(all_ips), cfg["MAX"])]
-    logging.info(f"Target IPs ({len(target_ips)}): {target_ips}")
+    logging.info(f"Desired Target IPs ({len(target_ips)}): {target_ips}")
 
-    # 4. Process DNS
+    # 4. 执行 DNS 比对分析
     client = SpaceshipDNS(cfg["DOMAIN"], cfg["KEY"], cfg["SECRET"], cfg["URL"])
     current_records = client.get_all_records()
     
-    to_delete = []
-    to_add = []
+    to_delete = list()
+    to_add = list()
 
+    # 针对每个子域名，计算出真正的差异 (Diff)
     for sub in cfg["SUBS"]:
-        # Identify records to delete (Type A matching subdomain)
+        existing_ips = set()
+        
+        # 寻找当前线上已经存在的该子域名 A 记录 IP
         for record in current_records:
             if record.get('type') == 'A' and record.get('name') == sub:
-                to_delete.append(record)
+                existing_ips.add(record.get('address'))
         
-        # Prepare records to add
-        for ip in target_ips:
+        desired_ips = set(target_ips)
+        
+        # 计算交集/差集：只提交全新出现的 IP
+        for ip in (desired_ips - existing_ips):
             to_add.append({
                 "type": "A",
                 "name": sub,
                 "address": ip,
                 "ttl": cfg["TTL"]
             })
+            
+        # 计算交集/差集：只删除被淘汰的旧 IP
+        for ip in (existing_ips - desired_ips):
+            to_delete.append({
+                "type": "A",
+                "name": sub,
+                "address": ip
+            })
 
+    # 5. 提交执行
     if not to_delete and not to_add:
-        logging.info("No changes needed.")
+        logging.info("DNS is already up-to-date. No changes needed.")
     else:
-        client.update_records(to_delete, to_add)
-        logging.info("Update complete.")
+        client.update_records_zero_downtime(to_delete, to_add)
 
 if __name__ == "__main__":
     main()
